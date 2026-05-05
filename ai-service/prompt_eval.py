@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple
 sys.path.insert(0, os.path.dirname(__file__))
 
 from services.categoriser import PREDEFINED_CATEGORIES, categorise_text
-from services.chroma_store import init_collection, upsert_texts
+from services.demo_seed import seed_query_demo_collection
 from services.query_service import answer_query
 
 
@@ -66,27 +66,8 @@ def evaluate_categoriser() -> EvalResult:
     return EvalResult(accuracy_score, format_score, total_score, details)
 
 
-def _seed_query_collection() -> None:
-    collection = init_collection()
-    docs = [
-        "Cyclone Nivar damaged coastal substations and flooded roads in the delta region.",
-        "Central bank increased benchmark rates by 50 basis points to curb inflation.",
-        "A ransomware group encrypted records at a major city hospital network.",
-        "Parliament passed emergency procurement powers after weeks of debate.",
-        "A prolonged drought reduced reservoir levels and crop output in the north.",
-        "Port crane automation improved turnaround times for container shipments.",
-        "A new labor strike disrupted bus services in the capital for three days.",
-        "The high court suspended implementation of a facial-recognition policy.",
-        "A measles outbreak prompted emergency vaccination drives in two provinces.",
-        "Undersea cable repairs restored internet capacity after a regional outage.",
-    ]
-    ids = [f"seed-{i}" for i in range(1, len(docs) + 1)]
-    metadatas = [{"source": f"report-{i}"} for i in range(1, len(docs) + 1)]
-    upsert_texts(collection=collection, ids=ids, documents=docs, metadatas=metadatas)
-
-
 def evaluate_query_prompt() -> EvalResult:
-    _seed_query_collection()
+    seed_query_demo_collection()
     samples: List[Tuple[str, str]] = [
         ("What happened to coastal power and roads after the cyclone?", "seed-1"),
         ("Why did the central bank raise rates?", "seed-2"),

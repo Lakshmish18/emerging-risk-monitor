@@ -1,34 +1,17 @@
 import time
-from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+from services.ai_cache import (
+    get_cache_stats,
+    record_cache_miss,
+    set_cached,
+    try_get_cached,
+)
 from services.chroma_store import init_collection, query_text
-from services.groq_client import call_groq
+from services.fallback_responses import QUERY_ANSWER
+from services.groq_client import GROQ_MODEL_NAME, call_groq
 
-MAX_CACHE_SIZE = 100
-CACHE_TTL = 900  # 15 minutes
-
-_QUERY_CACHE: "OrderedDict[str, Tuple[Dict, float]]" = OrderedDict()
-_CACHE_HITS = 0
-_CACHE_MISSES = 0
-
-
-def get_cached(key: str) -> Optional[Dict]:
-    if key in _QUERY_CACHE:
-        value, timestamp = _QUERY_CACHE[key]
-        if time.time() - timestamp < CACHE_TTL:
-            _QUERY_CACHE.move_to_end(key)
-            return value
-        del _QUERY_CACHE[key]
-    return None
-
-
-def set_cached(key: str, value: Dict) -> None:
-    if key in _QUERY_CACHE:
-        _QUERY_CACHE.move_to_end(key)
-    _QUERY_CACHE[key] = (value, time.time())
-    if len(_QUERY_CACHE) > MAX_CACHE_SIZE:
-        _QUERY_CACHE.popitem(last=False)
+_CACHE_META_KEY = "__meta"
 
 
 def _build_sources(chroma_result: Dict) -> List[Dict]:
@@ -61,23 +44,54 @@ def _build_sources(chroma_result: Dict) -> List[Dict]:
     return sources
 
 
-def answer_query(question: str, top_k: int = 3) -> Dict:
-    global _CACHE_HITS, _CACHE_MISSES
-    cache_key = question.strip().lower()
-    cached = get_cached(cache_key)
-    if cached is not None:
-        _CACHE_HITS += 1
-        return cached
-    _CACHE_MISSES += 1
+def _avg_source_confidence(sources: List[Dict]) -> Optional[float]:
+    sims = [s.get("similarity") for s in sources if isinstance(s.get("similarity"), (int, float))]
+    if not sims:
+        return None
+    return max(0.0, min(1.0, sum(float(x) for x in sims) / len(sims)))
+
+
+def answer_query(question: str, top_k: int = 3, skip_cache: bool = False) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    cached = False
+
+    if not skip_cache:
+        raw_cached = try_get_cached(question, top_k)
+        if raw_cached is not None:
+            cached = True
+            meta = raw_cached.get(_CACHE_META_KEY) or {}
+            answer = raw_cached.get("answer", "")
+            sources = raw_cached.get("sources", [])
+            elapsed = (time.perf_counter() - t0) * 1000
+            return {
+                "answer": answer,
+                "sources": sources,
+                "model_used": str(meta.get("model_used") or GROQ_MODEL_NAME),
+                "tokens_used": int(meta.get("tokens_used") or 0),
+                "llm_time_ms": float(meta.get("llm_time_ms") or 0.0),
+                "response_time_ms": round(elapsed, 2),
+                "cached": True,
+                "is_fallback": bool(meta.get("is_fallback", False)),
+                "confidence": meta.get("confidence"),
+            }
+        record_cache_miss()
 
     collection = init_collection()
     result = query_text(collection=collection, query=question, n_results=top_k)
     sources = _build_sources(result)
 
     if not sources:
+        elapsed = (time.perf_counter() - t0) * 1000
         return {
             "answer": "No relevant context found in the knowledge base.",
             "sources": [],
+            "model_used": GROQ_MODEL_NAME,
+            "tokens_used": 0,
+            "llm_time_ms": 0.0,
+            "response_time_ms": round(elapsed, 2),
+            "cached": False,
+            "is_fallback": False,
+            "confidence": None,
         }
 
     context_lines = []
@@ -90,7 +104,8 @@ def answer_query(question: str, top_k: int = 3) -> Dict:
     context_block = "\n\n".join(context_lines)
     system_prompt = (
         "You are a helpful risk-analysis assistant. Use ONLY the provided context to answer "
-        "the question. If context is insufficient, explicitly say so."
+        "the question. If context is insufficient, explicitly say so. "
+        "Reply in 2-6 sentences, plain language, no markdown fences."
     )
     user_prompt = (
         f"Question:\n{question}\n\n"
@@ -107,26 +122,44 @@ def answer_query(question: str, top_k: int = 3) -> Dict:
         max_tokens=500,
     )
 
-    answer = (
-        llm_result.get("content", "").strip()
-        if llm_result and llm_result.get("content")
-        else "Unable to generate answer right now."
-    )
+    is_fb = bool(llm_result.get("is_fallback"))
+    if is_fb:
+        answer = QUERY_ANSWER
+    else:
+        answer = (llm_result.get("content") or "").strip() or "Unable to generate answer right now."
 
-    final_result = {
+    conf = _avg_source_confidence(sources)
+    elapsed = (time.perf_counter() - t0) * 1000
+    llm_time = float(llm_result.get("latency_ms") or 0.0)
+
+    out = {
         "answer": answer,
         "sources": sources,
+        "model_used": str(llm_result.get("model") or GROQ_MODEL_NAME),
+        "tokens_used": int(llm_result.get("tokens_used") or 0),
+        "llm_time_ms": llm_time,
+        "response_time_ms": round(elapsed, 2),
+        "cached": False,
+        "is_fallback": is_fb,
+        "confidence": conf,
     }
-    set_cached(cache_key, final_result)
-    return final_result
+
+    if not skip_cache:
+        to_store = {
+            "answer": out["answer"],
+            "sources": out["sources"],
+            _CACHE_META_KEY: {
+                "model_used": out["model_used"],
+                "tokens_used": out["tokens_used"],
+                "llm_time_ms": out["llm_time_ms"],
+                "is_fallback": out["is_fallback"],
+                "confidence": out["confidence"],
+            },
+        }
+        set_cached(question, top_k, to_store)
+
+    return out
 
 
 def get_query_cache_stats() -> Dict:
-    total = _CACHE_HITS + _CACHE_MISSES
-    hit_rate = (_CACHE_HITS / total) if total else 0.0
-    return {
-        "hits": _CACHE_HITS,
-        "misses": _CACHE_MISSES,
-        "size": len(_QUERY_CACHE),
-        "hit_rate": round(hit_rate, 3),
-    }
+    return get_cache_stats()

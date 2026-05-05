@@ -22,12 +22,18 @@ def init_collection(
     embedding_model: str = DEFAULT_EMBED_MODEL,
 ) -> Collection:
     client = get_persistent_client(persist_directory=persist_directory)
+    # If the collection already exists on disk, reuse it — avoids embedding-function
+    # mismatch errors when an older DB used DefaultEmbeddingFunction vs SentenceTransformer.
+    existing = [c.name for c in client.list_collections()]
+    if collection_name in existing:
+        return client.get_collection(name=collection_name)
+
     try:
         embedding_fn = SentenceTransformerEmbeddingFunction(model_name=embedding_model)
     except ValueError:
-        # Fallback keeps retrieval functional when sentence-transformers is unavailable.
         embedding_fn = embedding_functions.DefaultEmbeddingFunction()
-    return client.get_or_create_collection(
+
+    return client.create_collection(
         name=collection_name,
         embedding_function=embedding_fn,
     )
